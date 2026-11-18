@@ -32,6 +32,11 @@ const (
 
 	// LocalBuildRegistry is Arcane's reserved registry host for locally built image tags.
 	LocalBuildRegistry = "arcane.local"
+
+	// PodmanLocalRegistry is the host Podman gives images that exist only on the
+	// daemon, from podman build or a local retag. A port, such as localhost:5000,
+	// names a real registry and is not this host.
+	PodmanLocalRegistry = "localhost"
 )
 
 // IsUpdateCheckDisabled reports whether labels opt the resource out of update

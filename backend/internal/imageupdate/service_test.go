@@ -1,6 +1,7 @@
 package imageupdate
 
 import (
+	"cmp"
 	"context"
 	"encoding/json/v2"
 	"errors"
@@ -227,6 +228,20 @@ func TestImageUpdateService_ParseImageReference(t *testing.T) {
 			wantTag:        "latest",
 		},
 		{
+			name:           "Podman localhost image with digest",
+			imageRef:       "localhost/myapp@" + alpineDigest,
+			wantRegistry:   "localhost",
+			wantRepository: "myapp",
+			wantTag:        "latest",
+		},
+		{
+			name:           "Local registry with port and digest",
+			imageRef:       "localhost:5000/myapp@" + alpineDigest,
+			wantRegistry:   "localhost:5000",
+			wantRepository: "myapp",
+			wantTag:        "latest",
+		},
+		{
 			name:           "Custom registry image with digest",
 			imageRef:       "registry.io/app/service@" + serviceDigest,
 			wantRegistry:   "registry.io",
@@ -436,8 +451,18 @@ func TestImageUpdateService_CheckImages_ComposeBuildMissingLocallySkipsRegistry(
 func newArcaneLocalImageUpdateService(t *testing.T, imageExists bool) (*ImageUpdateService, *atomic.Int32) {
 	t.Helper()
 
-	db := setupImageUpdateTestDB(t)
 	localDigest := digest.FromString("arcane-local-build").String()
+	return newInspectedImageUpdateService(t, imageExists, image.InspectResponse{
+		ID:          "sha256:arcane-local-image-id",
+		RepoTags:    []string{"arcane.local/demo-2ab41b29/worker:latest"},
+		RepoDigests: []string{"arcane.local/demo-2ab41b29/worker@" + localDigest},
+	}, digest.FromString("arcane-local-remote"))
+}
+
+func newInspectedImageUpdateService(t *testing.T, imageExists bool, inspected image.InspectResponse, remoteDigest digest.Digest) (*ImageUpdateService, *atomic.Int32) {
+	t.Helper()
+
+	db := setupImageUpdateTestDB(t)
 	dockerServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/containers/json") {
 			w.Header().Set("Content-Type", "application/json")
@@ -449,11 +474,7 @@ func newArcaneLocalImageUpdateService(t *testing.T, imageExists bool) (*ImageUpd
 
 		if imageExists && strings.Contains(r.URL.Path, "/images/") && strings.HasSuffix(r.URL.Path, "/json") {
 			w.Header().Set("Content-Type", "application/json")
-			assert.NoError(t, json.MarshalWrite(w, image.InspectResponse{
-				ID:          "sha256:arcane-local-image-id",
-				RepoTags:    []string{"arcane.local/demo-2ab41b29/worker:latest"},
-				RepoDigests: []string{"arcane.local/demo-2ab41b29/worker@" + localDigest},
-			}))
+			assert.NoError(t, json.MarshalWrite(w, inspected))
 			return
 		}
 		http.Error(w, "No such image", http.StatusNotFound)
@@ -468,7 +489,7 @@ func newArcaneLocalImageUpdateService(t *testing.T, imageExists bool) (*ImageUpd
 				distributionInspectFn: func(context.Context, string, client.DistributionInspectOptions) (client.DistributionInspectResult, error) {
 					registryCalls.Add(1)
 					return client.DistributionInspectResult{
-						Descriptor: v1.Descriptor{Digest: digest.FromString("arcane-local-remote")},
+						Descriptor: v1.Descriptor{Digest: remoteDigest},
 					}, nil
 				},
 			}, nil
@@ -540,14 +561,166 @@ func TestImageUpdateService_CheckImages_OtherDottedRegistryStillChecked(t *testi
 	assert.Positive(t, registryCalls.Load())
 }
 
+func TestLocalOnlyRegistryRef(t *testing.T) {
+	pinned := digest.FromString("podman-local").String()
+	tests := []struct {
+		name string
+		ref  string
+		want bool
+	}{
+		{name: "arcane local tag", ref: "arcane.local/demo/worker:latest", want: true},
+		{name: "podman localhost tag", ref: "localhost/myapp:1.0", want: true},
+		{name: "podman localhost digest", ref: "localhost/myapp@" + pinned, want: true},
+		{name: "podman localhost tag and digest", ref: "localhost/myapp:1.0@" + pinned, want: true},
+		{name: "podman pause", ref: "localhost/podman-pause:5.4.0", want: true},
+		{name: "mixed case localhost host", ref: "LocalHost/myapp:1.0", want: true},
+		{name: "localhost registry with port", ref: "localhost:5000/myapp:v1.0", want: false},
+		{name: "localhost registry with port and digest", ref: "localhost:5000/myapp@" + pinned, want: false},
+		{name: "registry.local", ref: "registry.local/team/app:latest", want: false},
+		{name: "ghcr tag", ref: "ghcr.io/vendor/app:1.2", want: false},
+		{name: "ghcr digest", ref: "ghcr.io/vendor/app@" + pinned, want: false},
+		{name: "docker hub", ref: "nginx:latest", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, localOnlyRegistryRef(tt.ref))
+		})
+	}
+}
+
+func TestImageUpdateService_CheckImageUpdate_PodmanLocalhostSkipsRegistry(t *testing.T) {
+	localDigest := digest.FromString("podman-local-build").String()
+	svc, registryCalls := newInspectedImageUpdateService(t, true, image.InspectResponse{
+		ID:          "sha256:podman-local-image-id",
+		RepoTags:    []string{"localhost/myapp:1.0"},
+		RepoDigests: []string{"localhost/myapp@" + localDigest},
+	}, digest.FromString("unused-remote"))
+	staleError := "registry manifest inspect of localhost/myapp:1.0 failed: fetch manifest digest: connect: connection refused"
+	require.NoError(t, svc.db.Create(&ImageUpdateRecord{
+		ID:         "sha256:podman-local-image-id",
+		Repository: "localhost/myapp",
+		Tag:        "1.0",
+		LastError:  &staleError,
+		CheckTime:  time.Now(),
+	}).Error)
+
+	result, err := svc.CheckImageUpdate(t.Context(), "localhost/myapp:1.0")
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Equal(t, UpdateTypeLocal, result.UpdateType)
+	assert.False(t, result.HasUpdate)
+	assert.Empty(t, result.Error)
+	assert.Zero(t, registryCalls.Load())
+
+	var saved ImageUpdateRecord
+	require.NoError(t, svc.db.First(&saved, "id = ?", "sha256:podman-local-image-id").Error)
+	assert.Equal(t, UpdateTypeLocal, saved.UpdateType)
+	assert.Nil(t, saved.LastError)
+}
+
+func TestImageUpdateService_CheckImages_PodmanLocalhostMissingImageSkipsRegistry(t *testing.T) {
+	svc, registryCalls := newInspectedImageUpdateService(t, false, image.InspectResponse{}, digest.FromString("unused-remote"))
+
+	results, err := checkImages(t, t.Context(), svc, "localhost/myapp:1.0")
+	require.NoError(t, err)
+	result := results["localhost/myapp:1.0"]
+	require.NotNil(t, result)
+	assert.Empty(t, result.Error)
+	assert.False(t, result.HasUpdate)
+	assert.Equal(t, UpdateTypeLocal, result.UpdateType)
+	assert.Zero(t, registryCalls.Load())
+}
+
+func TestImageUpdateService_CheckImages_PodmanLocalhostDigestSkipsRegistry(t *testing.T) {
+	pinned := digest.FromString("podman-digest-ref").String()
+	imageRef := "localhost/myapp@" + pinned
+	svc, registryCalls := newInspectedImageUpdateService(t, false, image.InspectResponse{}, digest.FromString("unused-remote"))
+
+	results, err := checkImages(t, t.Context(), svc, imageRef)
+	require.NoError(t, err)
+	result := results[imageRef]
+	require.NotNil(t, result)
+	assert.Empty(t, result.Error)
+	assert.False(t, result.HasUpdate)
+	assert.Equal(t, UpdateTypeLocal, result.UpdateType)
+	assert.Zero(t, registryCalls.Load())
+
+	var saved ImageUpdateRecord
+	require.NoError(t, svc.db.Where("repository = ? AND tag = ?", "localhost/myapp", "latest").First(&saved).Error)
+	assert.Equal(t, UpdateTypeLocal, saved.UpdateType)
+	assert.Nil(t, saved.LastError)
+}
+
+func TestImageUpdateService_CheckImages_LocalhostPortStillChecked(t *testing.T) {
+	svc, registryCalls := newInspectedImageUpdateService(t, false, image.InspectResponse{}, digest.FromString("unused-remote"))
+
+	results, err := checkImages(t, t.Context(), svc, "localhost:5000/myapp:latest")
+	require.NoError(t, err)
+	result := results["localhost:5000/myapp:latest"]
+	require.NotNil(t, result)
+	assert.Empty(t, result.Error)
+	assert.Equal(t, UpdateTypeNotPulled, result.UpdateType)
+	assert.Positive(t, registryCalls.Load())
+}
+
+func TestImageUpdateService_CheckImageUpdate_RetagLocalhostDoesNotHideRemote(t *testing.T) {
+	sharedDigest := digest.FromString("podman-retag")
+	const imageID = "sha256:podman-retag-image-id"
+	svc, registryCalls := newInspectedImageUpdateService(t, true, image.InspectResponse{
+		ID:       imageID,
+		RepoTags: []string{"ghcr.io/vendor/app:1.2", "localhost/myapp:pinned"},
+		RepoDigests: []string{
+			"ghcr.io/vendor/app@" + sharedDigest.String(),
+			"localhost/myapp@" + sharedDigest.String(),
+		},
+	}, sharedDigest)
+	staleError := "connection refused"
+	localhostRecordID := "tag::" + imageID + "::localhost/myapp@pinned"
+	require.NoError(t, svc.db.Create(&ImageUpdateRecord{
+		ID:         localhostRecordID,
+		Repository: "localhost/myapp",
+		Tag:        "pinned",
+		LastError:  &staleError,
+		CheckTime:  time.Now(),
+	}).Error)
+
+	localResult, err := svc.CheckImageUpdate(t.Context(), "localhost/myapp:pinned")
+	require.NoError(t, err)
+	require.NotNil(t, localResult)
+	assert.Equal(t, UpdateTypeLocal, localResult.UpdateType)
+	assert.Empty(t, localResult.Error)
+	assert.Zero(t, registryCalls.Load())
+
+	var localhostRecord ImageUpdateRecord
+	require.NoError(t, svc.db.First(&localhostRecord, "id = ?", localhostRecordID).Error)
+	assert.Equal(t, UpdateTypeLocal, localhostRecord.UpdateType)
+	assert.Nil(t, localhostRecord.LastError)
+
+	remoteResult, err := svc.CheckImageUpdate(t.Context(), "ghcr.io/vendor/app:1.2")
+	require.NoError(t, err)
+	require.NotNil(t, remoteResult)
+	assert.Equal(t, UpdateTypeDigest, remoteResult.UpdateType)
+	assert.Empty(t, remoteResult.Error)
+	assert.Positive(t, registryCalls.Load())
+
+	var remoteRecord ImageUpdateRecord
+	require.NoError(t, svc.db.First(&remoteRecord, "id = ?", imageID).Error)
+	assert.Equal(t, UpdateTypeDigest, remoteRecord.UpdateType)
+	assert.Nil(t, remoteRecord.LastError)
+	require.NoError(t, svc.db.First(&localhostRecord, "id = ?", localhostRecordID).Error)
+	assert.Equal(t, UpdateTypeLocal, localhostRecord.UpdateType)
+}
+
 func TestImageUpdateService_InspectLocalImageSnapshot_IsLocalBuild(t *testing.T) {
 	// The containerd image store gives every image a repo digest, pulled or not.
 	const repoDigest = "local-only@sha256:58fce97e65265c70d915f320949981079c7de4ef5c55f5f19642246401fb1d37"
 
+	podmanDigest := digest.FromString("podman-local").String()
 	tests := []struct {
-		inspect image.InspectResponse
-		name    string
-		want    bool
+		inspect  image.InspectResponse
+		name     string
+		imageRef string
+		want     bool
 	}{
 		{
 			name: "classic store image without repo digests",
@@ -588,6 +761,47 @@ func TestImageUpdateService_InspectLocalImageSnapshot_IsLocalBuild(t *testing.T)
 				Identity:    &image.Identity{Pull: []image.PullIdentity{{Repository: "docker.io/library/local-only"}}},
 			},
 		},
+		{
+			name:     "podman image with a localhost repo digest",
+			imageRef: "localhost/myapp:1.0",
+			inspect: image.InspectResponse{
+				ID:          "sha256:podman-local-image",
+				RepoTags:    []string{"localhost/myapp:1.0"},
+				RepoDigests: []string{"localhost/myapp@" + podmanDigest},
+			},
+			want: true,
+		},
+		{
+			name:     "podman localhost digest reference",
+			imageRef: "localhost/myapp@" + podmanDigest,
+			inspect: image.InspectResponse{
+				ID:          "sha256:podman-local-image",
+				RepoTags:    []string{"localhost/myapp:1.0"},
+				RepoDigests: []string{"localhost/myapp@" + podmanDigest},
+			},
+			want: true,
+		},
+		{
+			name:     "retag keeps the remote tag update-checked",
+			imageRef: "ghcr.io/vendor/app:1.2",
+			inspect: image.InspectResponse{
+				ID:       "sha256:podman-retag-image",
+				RepoTags: []string{"ghcr.io/vendor/app:1.2", "localhost/myapp:pinned"},
+				RepoDigests: []string{
+					"ghcr.io/vendor/app@" + podmanDigest,
+					"localhost/myapp@" + podmanDigest,
+				},
+			},
+		},
+		{
+			name:     "localhost with a port is a real registry",
+			imageRef: "localhost:5000/myapp:latest",
+			inspect: image.InspectResponse{
+				ID:          "sha256:local-registry-image",
+				RepoTags:    []string{"localhost:5000/myapp:latest"},
+				RepoDigests: []string{"localhost:5000/myapp@" + podmanDigest},
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -609,7 +823,7 @@ func TestImageUpdateService_InspectLocalImageSnapshot_IsLocalBuild(t *testing.T)
 			t.Cleanup(server.Close)
 
 			svc := &ImageUpdateService{dockerService: newImageUpdateTestDockerService(t, server)}
-			snapshot, err := svc.inspectLocalImageSnapshot(t.Context(), "local-only:latest", map[string]struct{}{})
+			snapshot, err := svc.inspectLocalImageSnapshot(t.Context(), cmp.Or(tt.imageRef, "local-only:latest"), map[string]struct{}{})
 			require.NoError(t, err)
 			assert.Equal(t, tt.want, snapshot.IsLocalBuild)
 		})

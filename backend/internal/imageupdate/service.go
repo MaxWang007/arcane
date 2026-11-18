@@ -405,6 +405,10 @@ func (s *ImageUpdateService) CheckImageUpdate(ctx context.Context, imageRef stri
 }
 
 func digestPinnedImageUpdateResult(imageRef, activityID string, responseTimeMs int) mo.Option[*types.ImageUpdateResponse] {
+	// A localhost or arcane.local digest name is a local image, not a pin to skip past.
+	if localOnlyRegistryRef(imageRef) {
+		return mo.None[*types.ImageUpdateResponse]()
+	}
 	pinnedDigest, ok := digest.FromReferenceSuffix(strings.TrimSpace(imageRef))
 	if !ok {
 		return mo.None[*types.ImageUpdateResponse]()
@@ -432,12 +436,32 @@ func digestPinnedImageUpdateResult(imageRef, activityID string, responseTimeMs i
 }
 
 func isLocalBuildImageRef(imageRef string, composeBuildRefs map[string]struct{}) bool {
-	if named, err := reference.ParseNormalizedNamed(strings.TrimSpace(imageRef)); err == nil &&
-		kitregistry.Normalize(reference.Domain(named)) == imageref.LocalBuildRegistry {
+	if localOnlyRegistryRef(imageRef) {
 		return true
 	}
 	_, ok := composeBuildRefs[refs.NormalizeImageUpdateRef(imageRef)]
 	return ok
+}
+
+// localOnlyRegistryRef reports whether imageRef names a registry that has no
+// remote to check. Arcane tags local builds as arcane.local. Podman tags local
+// builds and retags as localhost, including digest names localhost/repo@sha256:….
+// localhost:5000 and any other host stay remote.
+func localOnlyRegistryRef(imageRef string) bool {
+	trimmed := strings.TrimSpace(imageRef)
+	if _, found := digest.FromReferenceSuffix(trimmed); found {
+		trimmed, _, _ = strings.Cut(trimmed, "@")
+	}
+	named, err := reference.ParseNormalizedNamed(trimmed)
+	if err != nil {
+		return false
+	}
+	switch kitregistry.Normalize(reference.Domain(named)) {
+	case imageref.LocalBuildRegistry, imageref.PodmanLocalRegistry:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *ImageUpdateService) parseImageReference(imageRef string) *ImageParts {
@@ -467,7 +491,8 @@ func (s *ImageUpdateService) parseImageReference(imageRef string) *ImageParts {
 			return nil
 		}
 		parts := strings.Split(digestParts[0], "/")
-		if strings.Contains(parts[0], ".") || strings.Contains(parts[0], ":") {
+		// localhost has no dot or port, but Podman still uses it as the registry host.
+		if strings.Contains(parts[0], ".") || strings.Contains(parts[0], ":") || (len(parts) > 1 && strings.EqualFold(parts[0], imageref.PodmanLocalRegistry)) {
 			return &ImageParts{
 				Registry:   kitregistry.Normalize(parts[0]),
 				Repository: strings.Join(parts[1:], "/"),
@@ -489,7 +514,7 @@ func (s *ImageUpdateService) parseImageReference(imageRef string) *ImageParts {
 			Repository: "library/" + repository,
 			Tag:        tag,
 		}
-	case strings.Contains(parts[0], ".") || strings.Contains(parts[0], ":"):
+	case strings.Contains(parts[0], ".") || strings.Contains(parts[0], ":") || strings.EqualFold(parts[0], imageref.PodmanLocalRegistry):
 		repository, tag := splitTag(strings.Join(parts[1:], "/"))
 		return &ImageParts{
 			Registry:   kitregistry.Normalize(parts[0]),
