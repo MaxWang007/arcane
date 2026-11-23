@@ -1128,6 +1128,99 @@ func TestBuildSummariesUsesContainerTagPolicyUpdates(t *testing.T) {
 	require.Contains(t, string(encoded), `"autoUpdateEnabled":false`, "false status must stay serialized")
 }
 
+func dockerEnginePodmanService() *podman.Service {
+	return podman.NewService(podman.Config{
+		Engine: func(context.Context) (compat.EngineCompatibilityInfo, error) {
+			return compat.EngineCompatibilityInfo{Name: "docker"}, nil
+		},
+		Host: func() string { return "unix:///var/run/docker.sock" },
+	})
+}
+
+func TestContainerServiceGetContainerProcessesUsesLibpodWithoutPs(t *testing.T) {
+	const libpodTop = `{"Titles":["USER","PID","PPID","%CPU","ELAPSED","TTY","TIME","COMMAND"],"Processes":[["1000","1","0","0.098","5h57m26s","?","21s","/nodejs/bin/node /app/server.js"]]}`
+	psMissing := `{"message":"executing ps(1) in container: crun: executable file 'ps' not found in $PATH"}`
+
+	tests := []struct {
+		wantErr    error
+		name       string
+		body       string
+		wantTitles []string
+		wantRows   [][]string
+		status     int
+	}{
+		{
+			name:       "missing ps",
+			status:     http.StatusOK,
+			body:       libpodTop,
+			wantTitles: []string{"USER", "PID", "PPID", "%CPU", "ELAPSED", "TTY", "TIME", "COMMAND"},
+			wantRows:   [][]string{{"1000", "1", "0", "0.098", "5h57m26s", "?", "21s", "/nodejs/bin/node /app/server.js"}},
+		},
+		{
+			name:    "libpod error does not fall back to docker top",
+			status:  http.StatusConflict,
+			body:    `{"message":"top can only be used on running containers"}`,
+			wantErr: common.ErrConflict,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dockerTopCalls := 0
+			dockerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if dockerTestPath(r.URL.Path) == "/containers/distroless/top" {
+					dockerTopCalls++
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = io.WriteString(w, psMissing)
+			}))
+			t.Cleanup(dockerServer.Close)
+
+			var topQuery string
+			libpodServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch r.URL.Path {
+				case "/v4.0.0/libpod/version":
+					_, _ = w.Write([]byte(`{"Version":"6.2.0","ApiVersion":"5.0.0"}`))
+				case "/v4.0.0/libpod/info":
+					_, _ = w.Write([]byte(`{"host":{"security":{"rootless":false}}}`))
+				case "/v4.0.0/libpod/containers/distroless/top":
+					topQuery = r.URL.RawQuery
+					w.WriteHeader(tt.status)
+					_, _ = io.WriteString(w, tt.body)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			t.Cleanup(libpodServer.Close)
+
+			svc := NewContainerService(ContainerServiceParams{
+				DockerService: newSettingsDockerService(t, newTestDockerClient(t, dockerServer)),
+				PodmanService: podman.NewService(podman.Config{
+					Engine: func(context.Context) (compat.EngineCompatibilityInfo, error) {
+						return compat.EngineCompatibilityInfo{Name: "podman"}, nil
+					},
+					Host: func() string { return libpodServer.URL },
+					NewSystemd: func(bool) libpodman.Systemd {
+						return nil
+					},
+				}),
+			})
+
+			processes, err := svc.GetContainerProcesses(t.Context(), "distroless")
+			require.Equal(t, "stream=false", topQuery)
+			require.Zero(t, dockerTopCalls)
+			if tt.wantErr != nil {
+				require.ErrorIs(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tt.wantTitles, processes.Titles)
+			require.Equal(t, tt.wantRows, processes.Processes)
+		})
+	}
+}
+
 func TestContainerServiceGetContainerProcesses(t *testing.T) {
 	tests := []struct {
 		fallback *struct {
@@ -1212,6 +1305,7 @@ func TestContainerServiceGetContainerProcesses(t *testing.T) {
 			svc := NewContainerService(ContainerServiceParams{
 				DockerService:   newSettingsDockerService(t, newTestDockerClient(t, server)),
 				SettingsService: settingsService,
+				PodmanService:   dockerEnginePodmanService(),
 			})
 
 			processes, err := svc.GetContainerProcesses(t.Context(), "container-1")
@@ -1248,6 +1342,7 @@ func TestContainerServiceGetContainerProcessesPropagatesContext(t *testing.T) {
 	svc := NewContainerService(ContainerServiceParams{
 		DockerService:   newSettingsDockerService(t, newTestDockerClient(t, server)),
 		SettingsService: settingsService,
+		PodmanService:   dockerEnginePodmanService(),
 	})
 
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)

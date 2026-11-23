@@ -136,6 +136,14 @@ func (s *Service) Info(ctx context.Context) (types.PodmanInfo, error) {
 	return rt.Client.Info(ctx)
 }
 
+func (s *Service) ContainerTop(ctx context.Context, nameOrID string) (types.PodTop, error) {
+	rt, err := s.detect(ctx)
+	if err != nil {
+		return types.PodTop{}, err
+	}
+	return rt.Client.ContainerTop(ctx, nameOrID)
+}
+
 func (s *Service) PodCount(ctx context.Context) mo.Option[int] {
 	items, err := s.pods.List(ctx)
 	if err != nil {

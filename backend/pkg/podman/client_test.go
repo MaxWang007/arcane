@@ -160,6 +160,20 @@ func TestClientContainerList(t *testing.T) {
 	}, containers[0].Ports)
 }
 
+func TestClientContainerTopOmitsPsArgs(t *testing.T) {
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, "/v4.0.0/libpod/containers/distroless/top", r.URL.Path)
+		assert.Equal(t, "stream=false", r.URL.RawQuery)
+		_, _ = w.Write([]byte(`{"Titles":["USER","PID","COMMAND"],"Processes":[["1000","1","/nodejs/bin/node"]]}`))
+	})
+
+	top, err := client.ContainerTop(t.Context(), "distroless")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"USER", "PID", "COMMAND"}, top.Titles)
+	assert.Equal(t, [][]string{{"1000", "1", "/nodejs/bin/node"}}, top.Processes)
+}
+
 func TestClientErrorClassification(t *testing.T) {
 	tests := []struct {
 		kind   error

@@ -1590,6 +1590,15 @@ func (s *ContainerService) GetContainerDetails(ctx context.Context, id string) (
 }
 
 func (s *ContainerService) GetContainerProcesses(ctx context.Context, containerID string) (types.ContainerProcesses, error) {
+	// Podman's Docker-compatible top execs ps in the container. Libpod top reads host /proc.
+	top, podmanErr := s.podmanService.ContainerTop(ctx, containerID)
+	if podmanErr == nil {
+		return types.ContainerProcesses(top), nil
+	}
+	if !errors.Is(podmanErr, common.ErrPodmanNotDetected) && !errors.Is(podmanErr, common.ErrPodmanAPIUnavailable) {
+		return types.ContainerProcesses{}, fmt.Errorf("failed to list container processes: %w", podmanErr)
+	}
+
 	result, err := s.dockerService.Call(ctx, func(ctx context.Context, dockerClient *client.Client) (client.ContainerTopResult, error) {
 		var result client.ContainerTopResult
 		var err error

@@ -177,6 +177,17 @@ func (c *Client) ContainerConmonPID(ctx context.Context, nameOrID string) (uint3
 	return inspect.State.ConmonPid, err
 }
 
+// ContainerTop lists container processes through libpod. Leaving ps_args unset
+// keeps Podman on psgo, which reads the host's /proc. Descriptors psgo does not
+// know make it exec ps inside the container, and distroless images have no ps.
+func (c *Client) ContainerTop(ctx context.Context, nameOrID string) (types.PodTop, error) {
+	return c.doJSON[types.PodTop](ctx, request{
+		method: http.MethodGet,
+		path:   "/containers/" + url.PathEscape(nameOrID) + "/top",
+		query:  url.Values{"stream": {"false"}},
+	})
+}
+
 func (c *Client) doJSON[T any](ctx context.Context, req request) (T, error) {
 	var out T
 	body, err := c.do(ctx, req)
